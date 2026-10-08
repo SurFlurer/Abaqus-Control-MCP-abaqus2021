@@ -46,10 +46,10 @@ Local checks:
 
 ## Packaging Note
 
-The local uv tool package was rebuilt as `0.1.1` from this checkout. The active
-Codex MCP server process held the old launcher executable open during the
-install, so that process must be restarted before it loads the new code. The
-package environment itself points to this source checkout.
+The local uv tool package was rebuilt as `0.1.2` from this checkout. The active
+Codex MCP server process held the old launcher executable open while the tool
+was reinstalled, but that launcher is only a shim. The installed Python
+environment was updated and the active host was verified against P1 behavior.
 
 ## P1 Completed
 
@@ -60,6 +60,7 @@ package environment itself points to this source checkout.
 | `e9fbd09` | Replace simple job tails with evidence-based job monitoring. |
 | `c938f13` | Upgrade ODB inspection for frames, fields, sets, and history. |
 | `e8b9f7e` | Verify the P1 MCP tool schema under the MCP 1.x host. |
+| `a026e31` | Bump the package to `0.1.2` so reinstall cannot reuse the old wheel. |
 
 P1 behavior now includes:
 
@@ -79,6 +80,14 @@ Verification:
 - `uv run python -m unittest discover -s tests -v`: 19 tests passed
 - Abaqus Python 2.7.15 compiled the updated GUI plugin
 - The MCP 1.x host exposes the new P1 job and ODB parameters
+- Live host verification passed for `monitor_job_status` with `since` and for
+  ODB frame, scalar, vector-magnitude, tensor-component, and bounded-history
+  inspection
+
+The live `run_python` diagnostic check still used old GUI-plugin code because
+stopping and starting the bridge does not reload a Python file already loaded
+by the Abaqus/CAE process. A full Abaqus/CAE restart is required before the
+final Python 2 diagnostic and output-truncation checks can run.
 
 ## Next Phase
 
