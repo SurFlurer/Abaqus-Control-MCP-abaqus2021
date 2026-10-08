@@ -443,5 +443,120 @@ class JobStateTests(unittest.TestCase):
                 os.chdir(previous)
 
 
+class OdbInspectionTests(unittest.TestCase):
+    def setUp(self):
+        symbols = load_server_symbols("_code", "_ODB_CODE")
+        self.code_template = symbols["_ODB_CODE"]
+        self.render_code = symbols["_code"]
+
+    def test_read_only_field_and_bounded_history_inspection(self):
+        class Item:
+            def __init__(self, data, position="NODAL"):
+                self.data = data
+                self.position = position
+
+        class Field:
+            type = "VECTOR"
+            componentLabels = ["U1", "U2"]
+
+            def __init__(self, values):
+                self.values = values
+
+            def getSubset(self, region):
+                return self
+
+            def getScalarField(self, componentLabel):
+                return Field([Item(item.data[0], item.position) for item in self.values])
+
+        class Frame:
+            def __init__(self, index):
+                self.frameId = index
+                self.frameValue = float(index)
+                self.description = "frame %d" % index
+                self.fieldOutputs = {
+                    "U": Field([
+                        Item([3.0, 4.0]),
+                        Item([0.0, 5.0]),
+                    ])
+                }
+
+        class Output:
+            def __init__(self, data):
+                self.data = data
+
+        class Region:
+            historyOutputs = {
+                "U1": Output([[float(index), float(index)] for index in range(600)])
+            }
+
+        class Step:
+            description = "load step"
+            procedure = "Static"
+            domain = "TIME"
+            totalTime = 2.5
+            timePeriod = 1.5
+            frames = [Frame(0), Frame(1), Frame(2)]
+            historyRegions = {"Node 1": Region()}
+
+        class Odb:
+            title = "probe"
+            description = "test odb"
+            parts = {"PART-1": object()}
+            rootAssembly = types.SimpleNamespace(
+                instances={},
+                nodeSets={"SET-ALL": object()},
+                elementSets={},
+            )
+            steps = {"Step-1": Step()}
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        odb = Odb()
+        opened = {}
+        module = types.ModuleType("odbAccess")
+
+        def openOdb(path, readOnly):
+            opened["path"] = path
+            opened["readOnly"] = readOnly
+            return odb
+
+        module.openOdb = openOdb
+        with tempfile.TemporaryDirectory() as folder:
+            odb_path = Path(folder) / "probe.odb"
+            odb_path.write_bytes(b"odb")
+            code = self.render_code(
+                self.code_template,
+                odb_path=str(odb_path),
+                step="Step-1",
+                frame=-1,
+                variable="U",
+                set_name="",
+                component="",
+                history_region="Node 1",
+                history_variable="U1",
+                max_points=10,
+            )
+            scope = {}
+            with patch.dict(sys.modules, {"odbAccess": module}):
+                exec(code, scope)
+            result = scope["result"]
+
+        self.assertTrue(opened["readOnly"])
+        self.assertTrue(odb.closed)
+        self.assertEqual(result["steps"][0]["startTime"], 2.5)
+        self.assertEqual(result["steps"][0]["endTime"], 4.0)
+        self.assertEqual(result["steps"][0]["duration"], 1.5)
+        self.assertEqual(result["fieldSummary"]["quantity"], "magnitude")
+        self.assertEqual(result["fieldSummary"]["min"], 5.0)
+        self.assertEqual(result["fieldSummary"]["max"], 5.0)
+        self.assertEqual(result["historySummary"]["pointCount"], 600)
+        self.assertEqual(result["historySummary"]["returnedPoints"], 10)
+        self.assertEqual(len(result["historySummary"]["points"]), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

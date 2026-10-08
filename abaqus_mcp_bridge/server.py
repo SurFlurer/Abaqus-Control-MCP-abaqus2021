@@ -412,111 +412,311 @@ async def monitor_job_status(
     return await _exec(code, timeout)
 
 
-@mcp.tool()
-async def inspect_odb(odb_path: str, timeout: float | None = None) -> dict[str, Any]:
-    """Open an ODB file (read-only) and return its metadata.
-
-    Returns steps (with sliced frames and total time), parts, instances, section points,
-    and available field/history output variables with positions and components.
-    """
-    code = r"""
-from abaqus import mdb
+_ODB_CODE = r"""
+import math
+import os
 from odbAccess import openOdb
 
-odb_path = __ODB_PATH__
-info = {}
-odb = None
-try:
-    odb = openOdb(path=odb_path, readOnly=True)
-    info['title'] = str(getattr(odb, 'title', ''))
-    info['description'] = str(getattr(odb, 'description', ''))
-    info['parts'] = list(odb.parts.keys()) if hasattr(odb, 'parts') else []
-    info['instances'] = list(odb.rootAssembly.instances.keys()) if hasattr(odb, 'rootAssembly') else []
-    steps = []
+path = os.path.abspath(__ODB_PATH__)
+step_name = __STEP__
+frame_index = __FRAME__
+variable = __VARIABLE__
+set_name = __SET_NAME__
+component = __COMPONENT__
+history_region = __HISTORY_REGION__
+history_variable = __HISTORY_VARIABLE__
+max_points = __MAX_POINTS__
 
-    def _slice_frames(frames):
-        count = len(frames)
-        if count <= 5:
-            return list(frames)
-        idxs = [0]
-        for k in range(1, 4):
-            idxs.append(int(round(k * (count - 1) / 4.0)))
-        idxs.append(count - 1)
-        seen = set()
-        uniq = []
-        for i in idxs:
-            if i not in seen and 0 <= i < count:
-                uniq.append(i)
-                seen.add(i)
-        return [frames[i] for i in uniq]
+if not os.path.isfile(path):
+    raise IOError('ODB file not found: %s' % path)
 
-    def _field_meta(field_output):
-        meta = {}
-        try:
-            meta['position'] = str(getattr(field_output, 'position', ''))
-        except Exception:
-            meta['position'] = ''
-        comps = []
-        try:
-            comps = list(getattr(field_output, 'componentLabels', []) or [])
-        except Exception:
-            comps = []
-        try:
-            invariants = list(getattr(field_output, 'validInvariants', []) or [])
-        except Exception:
-            invariants = []
-        meta['components'] = comps + [str(x) for x in invariants if str(x) not in comps]
-        return meta
-
-    for sname in odb.steps.keys():
-        s = odb.steps[sname]
-        frames = []
-        for f in _slice_frames(s.frames):
-            frames.append({
-                'frameId': f.frameId,
-                'frameValue': f.frameValue,
-                'description': str(getattr(f, 'description', '')),
-            })
-        step_info = {
-            'name': sname,
-            'procedure': str(getattr(s, 'procedure', '')),
-            'totalTime': getattr(s, 'totalTime', 0.0),
-            'frames': frames,
-            'description': str(getattr(s, 'description', '')),
-        }
-        if s.frames:
-            try:
-                frame = s.frames[0]
-                fov = []
-                for desc in frame.fieldOutputs.keys():
-                    fo = frame.fieldOutputs[desc]
-                    meta = _field_meta(fo)
-                    meta['name'] = desc
-                    fov.append(meta)
-                step_info['fieldOutputs'] = fov
-            except Exception:
-                step_info['fieldOutputs'] = []
-            try:
-                frame = s.frames[-1]
-                hov = []
-                for desc in frame.historyOutputs.keys():
-                    hov.append(desc)
-                step_info['historyOutputs'] = hov
-            except Exception:
-                step_info['historyOutputs'] = []
-        steps.append(step_info)
-    info['steps'] = steps
-    result = {'success': True, 'data': info}
-except Exception as e:
-    import traceback
-    result = {'success': False, 'error': str(e), 'traceback': traceback.format_exc()}
-finally:
+def _finite(value):
     try:
-        if odb is not None:
-            odb.close()
-    except Exception:
-        pass
-""".replace("__ODB_PATH__", json.dumps(odb_path))
+        return math.isfinite(value)
+    except AttributeError:
+        return not (math.isnan(value) or math.isinf(value))
+
+odb = openOdb(path=path, readOnly=True)
+try:
+    def _step_meta(name, step):
+        domain = str(getattr(step, 'domain', ''))
+        start = float(getattr(step, 'totalTime', 0.0)) if domain == 'TIME' else None
+        duration = float(getattr(step, 'timePeriod', 0.0)) if domain == 'TIME' else None
+        count = len(step.frames)
+        if count <= 5:
+            indices = list(range(count))
+        else:
+            indices = sorted(set([
+                0,
+                count // 4,
+                count // 2,
+                (3 * count) // 4,
+                count - 1,
+            ]))
+        frames = []
+        for index in indices:
+            frame = step.frames[index]
+            frames.append({
+                'index': index,
+                'frameId': frame.frameId,
+                'frameValue': frame.frameValue,
+                'description': str(getattr(frame, 'description', '')),
+            })
+        fields = {}
+        if count:
+            for frame in (step.frames[0], step.frames[-1]):
+                for key in frame.fieldOutputs.keys():
+                    field = frame.fieldOutputs[key]
+                    fields[key] = {
+                        'name': key,
+                        'type': str(getattr(field, 'type', '')),
+                        'components': list(getattr(field, 'componentLabels', ()) or ()),
+                    }
+        regions = []
+        for key in list(step.historyRegions.keys())[:100]:
+            region = step.historyRegions[key]
+            regions.append({
+                'name': key,
+                'variables': list(region.historyOutputs.keys())[:100],
+            })
+        return {
+            'name': name,
+            'description': str(getattr(step, 'description', '')),
+            'procedure': str(getattr(step, 'procedure', '')),
+            'domain': domain,
+            'startTime': start,
+            'endTime': (
+                start + duration
+                if start is not None and duration is not None
+                else None
+            ),
+            'duration': duration,
+            'frameCount': count,
+            'frames': frames,
+            'fieldOutputs': list(fields.values()),
+            'historyRegions': regions,
+        }
+
+    names = list(odb.steps.keys())
+    if step_name and step_name not in odb.steps:
+        raise KeyError(
+            'Unknown step %r; available: %s' % (step_name, names)
+        )
+    selected_name = step_name or (names[-1] if names else None)
+    info = {
+        'path': path,
+        'title': str(getattr(odb, 'title', '')),
+        'description': str(getattr(odb, 'description', '')),
+        'parts': list(odb.parts.keys()),
+        'instances': list(odb.rootAssembly.instances.keys()),
+        'assemblyNodeSets': list(odb.rootAssembly.nodeSets.keys())[:200],
+        'assemblyElementSets': list(odb.rootAssembly.elementSets.keys())[:200],
+        'steps': [_step_meta(name, odb.steps[name]) for name in names],
+    }
+
+    if variable or history_variable:
+        if selected_name is None:
+            raise ValueError('ODB has no steps')
+        step = odb.steps[selected_name]
+        info['selectedStep'] = selected_name
+
+    if variable:
+        if not step.frames:
+            raise ValueError('Selected step has no frames')
+        index = frame_index if frame_index >= 0 else len(step.frames) + frame_index
+        if not 0 <= index < len(step.frames):
+            raise IndexError(
+                'frame index out of range; frameCount=%d' % len(step.frames)
+            )
+        frame = step.frames[index]
+        available_fields = list(frame.fieldOutputs.keys())
+        if variable not in frame.fieldOutputs:
+            raise KeyError(
+                'Field %r unavailable in selected frame; available: %s'
+                % (variable, available_fields)
+            )
+        field = frame.fieldOutputs[variable]
+        if set_name:
+            assembly = odb.rootAssembly
+            location = ''
+            if field.values:
+                location = str(field.values[0].position)
+            collection_names = (
+                ('nodeSets',)
+                if 'NODAL' in location
+                else ('elementSets',)
+            )
+            matches = []
+            for collection_name in collection_names:
+                collection = getattr(assembly, collection_name)
+                if set_name in collection:
+                    matches.append(collection[set_name])
+            for instance_name in assembly.instances.keys():
+                instance = assembly.instances[instance_name]
+                for collection_name in collection_names:
+                    collection = getattr(instance, collection_name)
+                    for key in collection.keys():
+                        if set_name == instance_name + '.' + key:
+                            matches.append(collection[key])
+            if not matches:
+                raise KeyError(
+                    'Unknown set %r; use assembly set or INSTANCE.SET'
+                    % set_name
+                )
+            if len(matches) != 1:
+                raise ValueError(
+                    'Set name is ambiguous; use INSTANCE.SET or a unique assembly set'
+                )
+            field = field.getSubset(region=matches[0])
+
+        if component:
+            labels = list(getattr(field, 'componentLabels', ()) or ())
+            if component not in labels:
+                raise KeyError(
+                    'Unknown component %r; available: %s'
+                    % (component, labels)
+                )
+            field = field.getScalarField(componentLabel=component)
+
+        count = 0
+        minimum = None
+        maximum = None
+        field_type = str(getattr(field, 'type', ''))
+        for item in field.values:
+            data = item.data
+            if hasattr(data, '__len__') and not isinstance(data, (str, bytes)):
+                if component:
+                    raise ValueError(
+                        'Component extraction returned nonscalar data'
+                    )
+                if field_type not in ('VECTOR', 'SCALAR'):
+                    raise ValueError('Tensor field requires a component')
+                scalar = math.sqrt(sum(float(part) ** 2 for part in data))
+            else:
+                scalar = float(data)
+            if not _finite(scalar):
+                continue
+            count += 1
+            minimum = scalar if minimum is None else min(minimum, scalar)
+            maximum = scalar if maximum is None else max(maximum, scalar)
+        quantity = (
+            'component'
+            if component
+            else ('magnitude' if field_type == 'VECTOR' else 'scalar')
+        )
+        info['fieldSummary'] = {
+            'step': selected_name,
+            'frameIndex': index,
+            'frameValue': frame.frameValue,
+            'variable': variable,
+            'component': component,
+            'set': set_name,
+            'quantity': quantity,
+            'count': count,
+            'min': minimum,
+            'max': maximum,
+        }
+
+    if history_variable:
+        keys = list(step.historyRegions.keys())
+        region_key = history_region or (keys[0] if len(keys) == 1 else None)
+        if region_key is None:
+            raise ValueError(
+                'Specify history_region; available: %s' % keys[:100]
+            )
+        if region_key not in step.historyRegions:
+            raise KeyError(
+                'Unknown history region %r; available: %s'
+                % (region_key, keys[:100])
+            )
+        outputs = step.historyRegions[region_key].historyOutputs
+        available_history = list(outputs.keys())
+        if history_variable not in outputs:
+            raise KeyError(
+                'Unknown history variable %r; available: %s'
+                % (history_variable, available_history)
+            )
+        points = outputs[history_variable].data
+        count = len(points)
+        if count <= max_points:
+            indices = list(range(count))
+        else:
+            indices = sorted(set([
+                int(round(i * (count - 1) / float(max_points - 1)))
+                for i in range(max_points)
+            ]))
+        sampled = [
+            [float(points[index][0]), float(points[index][1])]
+            for index in indices
+        ]
+        values = [
+            float(pair[1])
+            for pair in points
+            if _finite(float(pair[1]))
+        ]
+        info['historySummary'] = {
+            'step': selected_name,
+            'region': region_key,
+            'variable': history_variable,
+            'pointCount': count,
+            'returnedPoints': len(sampled),
+            'min': min(values) if values else None,
+            'max': max(values) if values else None,
+            'points': sampled,
+            'xAxis': (
+                'step time'
+                if str(getattr(step, 'domain', '')) == 'TIME'
+                else str(getattr(step, 'domain', ''))
+            ),
+        }
+    result = info
+finally:
+    odb.close()
+"""
+
+
+@mcp.tool()
+async def inspect_odb(
+    odb_path: str,
+    step: str = "",
+    frame: int = -1,
+    variable: str = "",
+    set_name: str = "",
+    component: str = "",
+    history_region: str = "",
+    history_variable: str = "",
+    max_points: int = 200,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Inspect an ODB read-only and optionally summarize fields or history.
+
+    Args:
+        odb_path: Path to the ODB file.
+        step: Step to inspect. Defaults to the last step.
+        frame: Frame index, with negative values counting from the end.
+        variable: Field output to summarize.
+        set_name: Optional assembly or INSTANCE.SET subset.
+        component: Optional vector/tensor component.
+        history_region: History region required when the step has several.
+        history_variable: History output to sample.
+        max_points: Maximum number of history points returned.
+    """
+    if not odb_path.strip():
+        raise ValueError("odb_path must not be empty")
+    if not 2 <= max_points <= 1000:
+        raise ValueError("max_points must be between 2 and 1000")
+    code = _code(
+        _ODB_CODE,
+        odb_path=odb_path,
+        step=step,
+        frame=int(frame),
+        variable=variable,
+        set_name=set_name,
+        component=component,
+        history_region=history_region,
+        history_variable=history_variable,
+        max_points=int(max_points),
+    )
     return await _exec(code, timeout or 60.0)
 
 
