@@ -15,6 +15,7 @@ from abaqusGui import (
     showAFXErrorDialog,
 )
 import base64
+import io
 import json
 import os
 import platform
@@ -56,14 +57,38 @@ class GuiBridgeExecutionError(RuntimeError):
 HOST = os.environ.get("ABAQUS_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ABAQUS_MCP_PORT", "48152"))
 LOG_PATH = os.path.join(tempfile.gettempdir(), "abaqus_mcp_gui_plugin.log")
+_DEBUG_LOG = os.environ.get("ABAQUS_MCP_DEBUG", "").lower() in ("1", "true", "yes", "on")
+_LOG_LIMIT = 1024 * 1024
+_LOG_LOCK = threading.Lock()
 
 
 def _log(message):
+    if not _DEBUG_LOG:
+        return
     try:
-        with open(LOG_PATH, "a") as handle:
-            handle.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+        with _LOG_LOCK:
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) >= _LOG_LIMIT:
+                rotated_path = LOG_PATH + ".1"
+                try:
+                    if os.path.exists(rotated_path):
+                        os.remove(rotated_path)
+                    os.rename(LOG_PATH, rotated_path)
+                except Exception:
+                    pass
+            with io.open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(u"%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
     except Exception:
         pass
+
+
+def _clear_old_log():
+    if _DEBUG_LOG:
+        return
+    for path in (LOG_PATH, LOG_PATH + ".1"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _announce(message):
@@ -137,6 +162,11 @@ try:
     import builtins
 except ImportError:
     import __builtin__ as builtins
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
 
 code = base64.b64decode("__ABAQUS_MCP_CODE__").decode("utf-8")
 response_path = base64.b64decode("__ABAQUS_MCP_RESPONSE__").decode("utf-8")
@@ -804,6 +834,40 @@ def _format_execution_error(source, exc, namespace=None, tb=None):
         "recovery": recovery,
     }
 
+
+_MAX_OUTPUT = 4000
+
+
+class _LimitedWriter(object):
+    encoding = "utf-8"
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.parts = []
+        self.count = 0
+
+    def write(self, value):
+        if not isinstance(value, string_types):
+            value = str(value)
+        length = len(value)
+        if self.count < self.limit:
+            self.parts.append(value[:self.limit - self.count])
+        self.count += length
+        return length
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        result = "".join(self.parts)
+        if self.count > self.limit:
+            result += "\n... (truncated, total %d chars)" % self.count
+        return result
+
+
 namespace = globals().setdefault("_ABAQUS_MCP_GLOBALS", {
     "__name__": "__abaqus_mcp_exec__",
     "__doc__": None,
@@ -822,8 +886,8 @@ if len(code) <= 262144:
     if len(source_keys) > 128:
         linecache.cache.pop(source_keys.pop(0), None)
 
-stdout = io.StringIO()
-stderr = io.StringIO()
+stdout = _LimitedWriter(_MAX_OUTPUT)
+stderr = _LimitedWriter(_MAX_OUTPUT)
 returned = None
 mode = "exec"
 payload = None
@@ -1083,6 +1147,7 @@ def start_gui_agent():
     if _SERVER is not None:
         _log("start requested, already running")
         return "Abaqus MCP GUI agent is already running on %s:%s" % (HOST, PORT)
+    _clear_old_log()
     _log("starting GUI agent on %s:%s" % (HOST, PORT))
     _SERVER = McpGuiServer((HOST, PORT), McpGuiHandler)
     thread = threading.Thread(target=_SERVER.serve_forever, name="AbaqusMcpGuiAgent")

@@ -2,10 +2,13 @@
 
 import ast
 import base64
+import io
 import json
+import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -150,6 +153,44 @@ class KernelResultLifecycleTests(unittest.TestCase):
         self.assertIn("repr failed", first["return_value"]["repr"])
         self.assertIsNone(second["return_value"])
         self.assertEqual(second["stdout"], "second only\n")
+
+    def test_stdout_and_stderr_are_truncated_with_total_length(self):
+        result = self.execute(
+            "import sys\n"
+            "print('x' * 5000)\n"
+            "sys.stderr.write('y' * 5000)",
+            "limited-output",
+        )
+
+        self.assertTrue(result["stdout"].endswith("(truncated, total 5001 chars)"))
+        self.assertTrue(result["stderr"].endswith("(truncated, total 5000 chars)"))
+        self.assertLess(len(result["stdout"]), 4100)
+        self.assertLess(len(result["stderr"]), 4100)
+
+    def test_plugin_log_is_disabled_by_default_and_rotated_in_debug_mode(self):
+        scope = load_plugin_symbols("_log", "_clear_old_log")
+        with tempfile.TemporaryDirectory() as folder:
+            log_path = Path(folder) / "abaqus_mcp_gui_plugin.log"
+            log_path.write_text("old log", encoding="utf-8")
+            scope.update({
+                "io": io,
+                "os": os,
+                "time": time,
+                "LOG_PATH": str(log_path),
+                "_DEBUG_LOG": False,
+                "_LOG_LIMIT": 20,
+                "_LOG_LOCK": threading.Lock(),
+            })
+
+            scope["_clear_old_log"]()
+            scope["_log"]("disabled")
+            self.assertFalse(log_path.exists())
+
+            scope["_DEBUG_LOG"] = True
+            scope["_log"]("first entry")
+            scope["_log"]("second entry")
+            self.assertTrue(log_path.exists())
+            self.assertTrue(Path(str(log_path) + ".1").exists())
 
 
 class _FakeSocket:
