@@ -9,8 +9,10 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from abaqus_mcp_bridge import client as client_module
@@ -18,6 +20,7 @@ from abaqus_mcp_bridge.client import AbaqusBridgeClient, BridgeError
 
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "abaqus_mcp_bridge" / "gui_plugin.py"
+SERVER_PATH = Path(__file__).resolve().parents[1] / "abaqus_mcp_bridge" / "server.py"
 
 
 def load_plugin_symbols(*names):
@@ -30,6 +33,24 @@ def load_plugin_symbols(*names):
     scope = {"base64": base64, "sys": sys, "threading": threading}
     module = ast.Module(body=symbols, type_ignores=[])
     exec(compile(module, str(PLUGIN_PATH), "exec"), scope)
+    return scope
+
+
+def load_server_symbols(*names):
+    source = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
+    symbols = []
+    for node in source.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
+            symbols.append(node)
+        elif isinstance(node, ast.Assign):
+            if any(
+                isinstance(target, ast.Name) and target.id in names
+                for target in node.targets
+            ):
+                symbols.append(node)
+    scope = {"Any": Any}
+    module = ast.Module(body=symbols, type_ignores=[])
+    exec(compile(module, str(SERVER_PATH), "exec"), scope)
     return scope
 
 
@@ -302,6 +323,124 @@ class ClientExecutionIdTests(unittest.TestCase):
 
         self.assertTrue(item.cancel_if_queued())
         self.assertFalse(item.start_if_queued())
+
+
+class JobStateTests(unittest.TestCase):
+    def setUp(self):
+        symbols = load_server_symbols("_code", "_JOB_CODE")
+        self.code_template = symbols["_JOB_CODE"]
+        self.render_code = symbols["_code"]
+
+    def execute_job_code(self, job, terminate=False, since=None):
+        fake_abaqus = types.ModuleType("abaqus")
+        fake_abaqus.mdb = types.SimpleNamespace(jobs={"Probe": job} if job else {})
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                os.chdir(folder)
+                if terminate:
+                    Path("Probe.lck").write_text("still running", encoding="utf-8")
+                code = self.render_code(
+                    self.code_template,
+                    job_name="Probe",
+                    terminate=terminate,
+                    since=since,
+                )
+                scope = {}
+                with patch.dict(sys.modules, {"abaqus": fake_abaqus}):
+                    exec(code, scope)
+                return scope["result"], folder
+            finally:
+                os.chdir(previous)
+
+    def test_old_completion_marker_does_not_override_running_cae_job(self):
+        class Job:
+            status = "RUNNING"
+
+        fake_abaqus = types.ModuleType("abaqus")
+        fake_abaqus.mdb = types.SimpleNamespace(jobs={"Probe": Job()})
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                os.chdir(folder)
+                Path("Probe.log").write_text(
+                    "Abaqus JOB Probe COMPLETED\n",
+                    encoding="utf-8",
+                )
+                Path("Probe.sta").write_text(
+                    "1  16  1  0  0\nTHE ANALYSIS HAS COMPLETED SUCCESSFULLY\n",
+                    encoding="utf-8",
+                )
+                Path("Probe.dat").write_text(
+                    "0 ERROR MESSAGES\n0 WARNING MESSAGES\n",
+                    encoding="utf-8",
+                )
+                Path("Probe.lck").write_text("active", encoding="utf-8")
+                code = self.render_code(
+                    self.code_template,
+                    job_name="Probe",
+                    terminate=False,
+                    since=None,
+                )
+                scope = {}
+                with patch.dict(sys.modules, {"abaqus": fake_abaqus}):
+                    exec(code, scope)
+                result = scope["result"]
+                self.assertEqual(result["state"], "UNKNOWN")
+                self.assertFalse(result["terminal"])
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["warnings"], [])
+            finally:
+                os.chdir(previous)
+
+    def test_kill_request_requires_terminal_evidence(self):
+        class Job:
+            status = "RUNNING"
+
+            def kill(self):
+                self.status = "TERMINATED"
+
+        result, _ = self.execute_job_code(Job(), terminate=True, since=None)
+
+        self.assertTrue(result["termination"]["requested"])
+        self.assertFalse(result["termination"]["confirmed"])
+        self.assertEqual(result["state"], "UNKNOWN")
+
+    def test_file_only_completion_needs_a_run_start_time(self):
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                os.chdir(folder)
+                Path("Probe.log").write_text(
+                    "Abaqus JOB Probe COMPLETED\n",
+                    encoding="utf-8",
+                )
+                fake_abaqus = types.ModuleType("abaqus")
+                fake_abaqus.mdb = types.SimpleNamespace(jobs={})
+                code = self.render_code(
+                    self.code_template,
+                    job_name="Probe",
+                    terminate=False,
+                    since=None,
+                )
+                unknown = {}
+                with patch.dict(sys.modules, {"abaqus": fake_abaqus}):
+                    exec(code, unknown)
+                code = self.render_code(
+                    self.code_template,
+                    job_name="Probe",
+                    terminate=False,
+                    since=1.0,
+                )
+                known = {}
+                with patch.dict(sys.modules, {"abaqus": fake_abaqus}):
+                    exec(code, known)
+
+                self.assertEqual(unknown["result"]["state"], "UNKNOWN")
+                self.assertEqual(unknown["result"]["fileState"], "COMPLETED")
+                self.assertEqual(known["result"]["state"], "COMPLETED")
+            finally:
+                os.chdir(previous)
 
 
 if __name__ == "__main__":

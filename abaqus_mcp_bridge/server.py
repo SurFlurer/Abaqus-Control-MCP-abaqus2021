@@ -94,6 +94,12 @@ async def _exec(code: str, timeout: float | None = None) -> dict[str, Any]:
     return await anyio.to_thread.run_sync(_client(timeout).execute, code)
 
 
+def _code(template: str, **values: Any) -> str:
+    for key, value in values.items():
+        template = template.replace("__" + key.upper() + "__", repr(value))
+    return template
+
+
 # ---------------------------------------------------------------------------
 # Core tools
 # ---------------------------------------------------------------------------
@@ -171,72 +177,238 @@ except Exception as e:
     return await _exec(code, timeout)
 
 
-@mcp.tool()
-async def monitor_job_status(job_name: str = "", timeout: float | None = None) -> dict[str, Any]:
-    """Monitor Abaqus job status and optional OS-level progress from .sta/.msg files.
-
-    Args:
-        job_name: If provided, read [JobName].sta and [JobName].msg in the working
-            directory to extract recent progress and diagnostics. If empty, list
-            all jobs defined in the current Abaqus session.
-    """
-    code = r"""
+_JOB_CODE = r"""
 import os
 import re
+import time
 from abaqus import mdb
 
-job_name = __JOB_NAME__
+name = __JOB_NAME__
+terminate = __TERMINATE__
+since = __SINCE__
+root = os.getcwd()
 
-def _tail_lines(path, count):
-    try:
-        with open(path, 'r') as f:
-            lines = f.read().splitlines()
-        if count <= 0:
-            return []
-        return lines[-count:]
-    except Exception:
-        return []
+def _tail(path, maximum=262144):
+    if not os.path.isfile(path):
+        return ''
+    with open(path, 'rb') as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - maximum))
+        return handle.read().decode('utf-8', 'replace')
 
-def _grep_tail(path, patterns, limit):
-    try:
-        rx = re.compile('|'.join(patterns))
-        matches = []
-        with open(path, 'r') as f:
-            for line in f:
-                if rx.search(line):
-                    matches.append(line.rstrip())
-        return matches[-limit:] if limit > 0 else matches
-    except Exception:
-        return []
-
-result = {}
-if not job_name:
-    jobs = []
-    for name in mdb.jobs.keys():
-        job = mdb.jobs[name]
-        j = {'name': name}
-        for attr in ('status', 'type', 'model', 'description', 'numCpus', 'numDomains', 'memory', 'explicitPrecision'):
-            try:
-                val = getattr(job, attr, None)
-                if val is not None:
-                    j[attr] = str(val)
-            except Exception:
-                pass
-        jobs.append(j)
-    result = {'jobs': jobs}
-else:
-    sta_path = os.path.join(os.getcwd(), job_name + '.sta')
-    msg_path = os.path.join(os.getcwd(), job_name + '.msg')
-    progress_lines = _tail_lines(sta_path, 5)
-    diagnostic_lines = _grep_tail(msg_path, [r'^\*\*\*ERROR', r'^\*\*\*WARNING'], 10)
-    result = {
-        'job_name': job_name,
-        'sta_path': sta_path,
-        'msg_path': msg_path,
-        'progress_tail': progress_lines,
-        'diagnostics_tail': diagnostic_lines,
+def _file_info(path):
+    exists = os.path.isfile(path)
+    return {
+        'path': path,
+        'exists': exists,
+        'modifiedAt': os.path.getmtime(path) if exists else None,
     }
-""".replace("__JOB_NAME__", json.dumps(job_name.strip()))
+
+def _status(job):
+    try:
+        return str(job.status).upper() if job is not None else None
+    except Exception:
+        return None
+
+if not name:
+    result = {
+        'jobs': [
+            {'name': key, 'caeStatus': _status(mdb.jobs[key])}
+            for key in mdb.jobs.keys()
+        ],
+        'workingDirectory': root,
+    }
+else:
+    if name != os.path.basename(name) or name in ('.', '..'):
+        raise ValueError('job_name must be a single file name')
+    job = mdb.jobs[name] if name in mdb.jobs else None
+    if terminate and job is None:
+        raise ValueError('Termination requires a job registered in the current CAE session')
+
+    kill_requested = False
+    kill_error = None
+    terminal_cae = ('COMPLETED', 'ABORTED', 'TERMINATED', 'CHECK_COMPLETED')
+    if terminate:
+        if _status(job) in terminal_cae:
+            kill_error = 'Job already has a terminal CAE status; no kill command sent'
+        else:
+            try:
+                job.kill()
+                kill_requested = True
+            except Exception as exc:
+                kill_error = '%s: %s' % (type(exc).__name__, exc)
+            deadline = time.time() + 5.0
+            while (
+                kill_requested
+                and time.time() < deadline
+                and _status(job) not in ('TERMINATED', 'ABORTED', 'COMPLETED')
+            ):
+                time.sleep(0.25)
+
+    paths = {
+        ext: os.path.join(root, name + '.' + ext)
+        for ext in ('log', 'sta', 'dat', 'msg', 'lck')
+    }
+    files = dict((ext, _file_info(path)) for ext, path in paths.items())
+    log = _tail(paths['log'])
+    sta = _tail(paths['sta'])
+    dat = _tail(paths['dat'])
+    msg = _tail(paths['msg'])
+    cae = _status(job)
+    combined = '\n'.join((log, sta, dat, msg))
+    diagnostics = [
+        line.strip()
+        for line in combined.splitlines()
+        if re.search(r'^\s*(?:\*{2,}\s*|ABAQUS\s+)(?:ERROR|WARNING)\b', line, re.I)
+    ]
+    errors = [
+        line for line in diagnostics if re.search(r'\bERROR\b', line, re.I)
+    ][-10:]
+    warnings = [
+        line for line in diagnostics if re.search(r'\bWARNING\b', line, re.I)
+    ][-10:]
+
+    log_upper = log.upper()
+    sta_upper = sta.upper()
+    file_state = None
+    if re.search(
+        r'ABAQUS JOB .* (?:ABORTED|FAILED)|THE ANALYSIS HAS NOT BEEN COMPLETED|'
+        r'\bA N A L Y S I S\s+T E R M I N A T E D\b',
+        log_upper,
+    ):
+        file_state = 'FAILED'
+    elif re.search(r'ABAQUS JOB .* TERMINATED|USER REQUESTED TERMINATION', log_upper):
+        file_state = 'TERMINATED'
+    elif re.search(
+        r'ABAQUS JOB .* COMPLETED|THE ANALYSIS HAS COMPLETED SUCCESSFULLY',
+        log_upper + '\n' + sta_upper,
+    ):
+        file_state = 'COMPLETED'
+
+    cae_state = {
+        'COMPLETED': 'COMPLETED',
+        'CHECK_COMPLETED': 'COMPLETED',
+        'ABORTED': 'FAILED',
+        'TERMINATED': 'TERMINATED',
+        'RUNNING': 'RUNNING',
+        'CHECK_RUNNING': 'RUNNING',
+        'SUBMITTED': 'SUBMITTED',
+    }.get(cae)
+    lock_exists = files['lck']['exists']
+    terminal_mtime = max(
+        [
+            files[ext]['modifiedAt']
+            for ext in ('log', 'sta')
+            if files[ext]['modifiedAt'] is not None
+        ]
+        or [0]
+    )
+    file_is_fresh = since is not None and terminal_mtime >= since
+    effective_file_state = file_state if since is None or file_is_fresh else None
+    conflict = bool(
+        effective_file_state
+        and cae_state
+        and (
+            cae_state in ('RUNNING', 'SUBMITTED')
+            or (
+                cae_state in ('COMPLETED', 'FAILED', 'TERMINATED')
+                and cae_state != effective_file_state
+            )
+        )
+    )
+
+    if conflict:
+        state, source = 'UNKNOWN', 'conflicting CAE and file evidence'
+    elif cae_state in ('COMPLETED', 'FAILED', 'TERMINATED') and lock_exists:
+        state, source = 'UNKNOWN', 'terminal CAE status while lock file exists'
+    elif cae_state in ('COMPLETED', 'FAILED', 'TERMINATED'):
+        state, source = cae_state, 'CAE job status'
+    elif effective_file_state and not lock_exists and job is None and file_is_fresh:
+        state, source = effective_file_state, 'log/status file modified after since'
+    elif file_state and not lock_exists and job is None:
+        state, source = 'UNKNOWN', 'file terminal marker but current run freshness unverified'
+    elif file_state and not lock_exists and job is not None and cae_state is None:
+        state, source = 'UNKNOWN', 'terminal file marker without a current CAE run'
+    elif effective_file_state and lock_exists:
+        state, source = 'UNKNOWN', 'terminal file marker while lock file exists'
+    elif cae_state:
+        state, source = cae_state, 'CAE job status'
+    elif lock_exists:
+        state, source = 'UNKNOWN', 'lock file only; process not verified'
+    else:
+        state, source = 'UNKNOWN', 'insufficient evidence'
+
+    progress = [line.strip() for line in sta.splitlines() if line.strip()]
+    numeric = [line for line in progress if re.match(r'^\d+\s+\d+\s+', line)]
+    current_step = None
+    increment = None
+    if numeric:
+        match = re.match(r'^(\d+)\s+(\d+)\b', numeric[-1])
+        if match:
+            current_step = int(match.group(1))
+            increment = int(match.group(2))
+
+    result = {
+        'jobName': name,
+        'workingDirectory': root,
+        'state': state,
+        'terminal': state in ('COMPLETED', 'FAILED', 'TERMINATED'),
+        'source': source,
+        'caeStatus': cae,
+        'fileState': file_state,
+        'currentStep': current_step,
+        'increment': increment,
+        'progressTail': progress[-8:],
+        'errors': errors,
+        'warnings': warnings,
+        'errorCountInTails': len(
+            [line for line in diagnostics if re.search(r'\bERROR\b', line, re.I)]
+        ),
+        'warningCountInTails': len(
+            [line for line in diagnostics if re.search(r'\bWARNING\b', line, re.I)]
+        ),
+        'files': files,
+        'observedAt': time.time(),
+        'since': since,
+        'runFreshness': (
+            'confirmed by CAE'
+            if source == 'CAE job status' and state in ('COMPLETED', 'FAILED', 'TERMINATED')
+            else ('bounded by since' if file_is_fresh else 'unverified')
+        ),
+    }
+    if terminate:
+        result['termination'] = {
+            'requested': kill_requested,
+            'confirmed': state == 'TERMINATED' and not lock_exists,
+            'error': kill_error,
+        }
+"""
+
+
+@mcp.tool()
+async def monitor_job_status(
+    job_name: str = "",
+    terminate: bool = False,
+    since: float | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Inspect Abaqus job state using CAE and filesystem evidence.
+
+    Args:
+        job_name: Job to inspect. If empty, list the jobs registered in CAE.
+        terminate: Request termination and report requested/confirmed separately.
+        since: Unix submission time used to bind file-only evidence to a run.
+    """
+    if terminate and not job_name.strip():
+        raise ValueError("job_name is required for termination")
+    if since is not None and not 0 <= since <= 4102444800:
+        raise ValueError("since must be a Unix timestamp between 1970 and 2100")
+    code = _code(
+        _JOB_CODE,
+        job_name=job_name.strip(),
+        terminate=bool(terminate),
+        since=since,
+    )
     return await _exec(code, timeout)
 
 
