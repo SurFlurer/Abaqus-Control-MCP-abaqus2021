@@ -126,7 +126,10 @@ code = base64.b64decode("__ABAQUS_MCP_CODE__").decode("utf-8")
 response_path = base64.b64decode("__ABAQUS_MCP_RESPONSE__").decode("utf-8")
 
 def _exec_compiled(compiled, namespace):
-    exec("exec compiled in namespace, namespace")
+    if sys.version_info[0] < 3:
+        exec("exec compiled in namespace, namespace")
+    else:
+        exec(compiled, namespace, namespace)
 
 class _redirect_streams(object):
     def __init__(self, stdout, stderr):
@@ -404,6 +407,7 @@ namespace.update({
     "mdb": globals().get("mdb"),
     "session": globals().get("session"),
 })
+namespace.pop("result", None)
 
 stdout = io.StringIO()
 stderr = io.StringIO()
@@ -420,7 +424,7 @@ try:
                 parsed = ast.parse(code, mode="exec")
                 compiled = compile(parsed, "<abaqus-mcp>", "exec")
                 _exec_compiled(compiled, namespace)
-                returned = namespace.get("result")
+                returned = namespace.pop("result", None)
             else:
                 mode = "eval"
                 compiled = compile(parsed, "<abaqus-mcp>", "eval")
@@ -448,6 +452,8 @@ except Exception as exc:
         "ok": True,
         "result": _format_execution_error(code, exc),
     }
+finally:
+    namespace.pop("result", None)
 
 with open(response_path, "w") as handle:
     json.dump(_jsonable(payload), handle, ensure_ascii=True)
