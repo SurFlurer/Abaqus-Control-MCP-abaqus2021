@@ -558,5 +558,45 @@ class OdbInspectionTests(unittest.TestCase):
         self.assertEqual(len(result["historySummary"]["points"]), 10)
 
 
+class ServerRegistrationTests(unittest.TestCase):
+    def test_mcp_tools_expose_p1_parameters(self):
+        try:
+            import asyncio
+
+            from abaqus_mcp_bridge import server
+        except ImportError as exc:
+            self.skipTest("MCP host dependencies are unavailable: %s" % exc)
+
+        tools = asyncio.run(server.mcp.list_tools())
+        by_name = {tool.name: tool for tool in tools}
+
+        self.assertEqual(
+            sorted(by_name),
+            [
+                "capture_viewport",
+                "inspect_odb",
+                "monitor_job_status",
+                "ping",
+                "run_python",
+                "set_workdir",
+            ],
+        )
+        job_tool = by_name["monitor_job_status"]
+        job_schema = getattr(job_tool, "input_schema", None)
+        if job_schema is None:
+            job_schema = job_tool.inputSchema
+        job_properties = job_schema["properties"]
+        self.assertIn("terminate", job_properties)
+        self.assertIn("since", job_properties)
+        odb_tool = by_name["inspect_odb"]
+        odb_schema = getattr(odb_tool, "input_schema", None)
+        if odb_schema is None:
+            odb_schema = odb_tool.inputSchema
+        odb_properties = odb_schema["properties"]
+        self.assertIn("variable", odb_properties)
+        self.assertIn("history_variable", odb_properties)
+        self.assertIn("max_points", odb_properties)
+
+
 if __name__ == "__main__":
     unittest.main()
