@@ -51,12 +51,40 @@ Codex MCP server process held the old launcher executable open during the
 install, so that process must be restarted before it loads the new code. The
 package environment itself points to this source checkout.
 
+## P1 Completed
+
+| Commit | Change |
+| --- | --- |
+| `b2e1980` | Port Python 2 traceback handling and structured diagnostics. |
+| `76b8f72` | Bound captured output and make GUI request logging debug-only. |
+| `e9fbd09` | Replace simple job tails with evidence-based job monitoring. |
+| `c938f13` | Upgrade ODB inspection for frames, fields, sets, and history. |
+| `e8b9f7e` | Verify the P1 MCP tool schema under the MCP 1.x host. |
+
+P1 behavior now includes:
+
+- `sys.exc_info()[2]` based traceback extraction with original script paths
+- Compact user frames, syntax details, and bounded error suggestions
+- Import hints for missing Abaqus modules and constants
+- 4000-character stdout/stderr capture limits with total-length markers
+- Debug-only GUI logging with 1 MiB rotation
+- CAE and file-evidence reconciliation for job state
+- Separate termination requested/confirmed reporting
+- Read-only ODB metadata, field summaries, and bounded history samples
+
+Verification:
+
+- `python -m unittest discover -s tests -v`: 19 tests passed, 1 host-only test
+  skipped because system Python has no MCP SDK
+- `uv run python -m unittest discover -s tests -v`: 19 tests passed
+- Abaqus Python 2.7.15 compiled the updated GUI plugin
+- The MCP 1.x host exposes the new P1 job and ODB parameters
+
 ## Next Phase
 
-P1 work remains:
+P2 work remains:
 
-- Python 2 traceback and structured error diagnostics
-- Per-call stdout/stderr limits and debug-only GUI logging
-- Evidence-based Abaqus job monitoring
-- ODB step, frame, field, and bounded history inspection
-
+- Native MCP image content for viewport captures
+- Optional viewport save paths and additional image formats
+- Connection-refused versus timeout user messaging
+- Setup CLI decoupled from Claude-specific registration
