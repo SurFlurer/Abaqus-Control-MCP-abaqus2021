@@ -83,11 +83,12 @@ Verification:
 - Live host verification passed for `monitor_job_status` with `since` and for
   ODB frame, scalar, vector-magnitude, tensor-component, and bounded-history
   inspection
-
-The live `run_python` diagnostic check still used old GUI-plugin code because
-stopping and starting the bridge does not reload a Python file already loaded
-by the Abaqus/CAE process. A full Abaqus/CAE restart is required before the
-final Python 2 diagnostic and output-truncation checks can run.
+- After a full Abaqus/CAE restart, live Python 2 diagnostics passed for
+  KeyError, AttributeError, TypeError, NameError, and SyntaxError
+- Live stdout/stderr truncation returned the 4000-character prefix and original
+  total-length markers
+- Full Abaqus/CAE restart, not only a bridge stop/start, was required to reload
+  the Python GUI plugin
 
 ## Next Phase
 
