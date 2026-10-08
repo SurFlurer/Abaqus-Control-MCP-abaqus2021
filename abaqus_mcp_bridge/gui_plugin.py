@@ -6,6 +6,7 @@ search directory without requiring a source checkout.
 
 from abaqusGui import (
     AFXForm,
+    AFXMode,
     FXMAPFUNC,
     SEL_COMMAND,
     SEL_TIMEOUT,
@@ -624,16 +625,20 @@ class McpGuiActionForm(AFXForm):
         global _DISPATCHER
         AFXForm.__init__(self, owner)
         self.action = action
+        FXMAPFUNC(self, SEL_COMMAND, AFXMode.ID_ACTIVATE, McpGuiActionForm.onCmdActivate)
         FXMAPFUNC(self, SEL_COMMAND, self.ID_START, McpGuiActionForm.onCmdStart)
         FXMAPFUNC(self, SEL_COMMAND, self.ID_STOP, McpGuiActionForm.onCmdStop)
         FXMAPFUNC(self, SEL_TIMEOUT, self.ID_POLL, McpGuiActionForm.onTimeout)
         _DISPATCHER = self
 
-    def getFirstDialog(self):
+    def onCmdActivate(self, sender, sel, ptr):
         if self.action == "start":
-            self.onCmdStart(None, None, None)
+            return self.onCmdStart(sender, sel, ptr)
         elif self.action == "stop":
-            self.onCmdStop(None, None, None)
+            return self.onCmdStop(sender, sel, ptr)
+        return 1
+
+    def getFirstDialog(self):
         return None
 
     def _schedule_poll(self):
