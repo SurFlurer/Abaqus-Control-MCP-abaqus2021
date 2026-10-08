@@ -45,6 +45,14 @@ try:
 except NameError:
     string_types = (str,)
 
+
+class GuiBridgeExecutionError(RuntimeError):
+    def __init__(self, message, state="UNKNOWN", error_type="GuiBridgeExecutionError"):
+        RuntimeError.__init__(self, message)
+        self.state = state
+        self.error_type = error_type
+
+
 HOST = os.environ.get("ABAQUS_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ABAQUS_MCP_PORT", "48152"))
 LOG_PATH = os.path.join(tempfile.gettempdir(), "abaqus_mcp_gui_plugin.log")
@@ -107,9 +115,10 @@ def _as_utf8_bytes(value):
     return value.encode("utf-8")
 
 
-def _kernel_wrapper(code, response_path):
+def _kernel_wrapper(code, response_path, execution_id=""):
     encoded_code = base64.b64encode(_as_utf8_bytes(code)).decode("ascii")
     encoded_path = base64.b64encode(_as_utf8_bytes(response_path)).decode("ascii")
+    encoded_id = base64.b64encode(_as_utf8_bytes(execution_id)).decode("ascii")
     template = r'''
 import ast
 import base64
@@ -124,6 +133,7 @@ import traceback
 
 code = base64.b64decode("__ABAQUS_MCP_CODE__").decode("utf-8")
 response_path = base64.b64decode("__ABAQUS_MCP_RESPONSE__").decode("utf-8")
+execution_id = base64.b64decode("__ABAQUS_MCP_ID__").decode("ascii")
 
 def _exec_compiled(compiled, namespace):
     if sys.version_info[0] < 3:
@@ -431,6 +441,7 @@ try:
                 returned = eval(compiled, namespace, namespace)
         except Exception as exc:
             returned_error = _format_execution_error(code, exc, namespace)
+            returned_error["executionId"] = execution_id
             payload = {
                 "ok": True,
                 "result": returned_error,
@@ -442,15 +453,18 @@ try:
             "result": {
                 "mode": mode,
                 "ok": True,
+                "executionId": execution_id,
                 "return_value": _jsonable(returned),
                 "stdout": stdout.getvalue(),
                 "stderr": stderr.getvalue(),
             },
         }
 except Exception as exc:
+    execution_error = _format_execution_error(code, exc)
+    execution_error["executionId"] = execution_id
     payload = {
         "ok": True,
-        "result": _format_execution_error(code, exc),
+        "result": execution_error,
     }
 finally:
     namespace.pop("result", None)
@@ -461,17 +475,18 @@ with open(response_path, "w") as handle:
     command = (
         template.replace("__ABAQUS_MCP_CODE__", encoded_code)
         .replace("__ABAQUS_MCP_RESPONSE__", encoded_path)
+        .replace("__ABAQUS_MCP_ID__", encoded_id)
     )
     if sys.version_info[0] < 3 and isinstance(command, unicode):
         command = command.encode("ascii")
     return command
 
 
-def _run_kernel_code(code, timeout):
+def _run_kernel_code(code, timeout, execution_id=""):
     response_path = os.path.join(
         tempfile.gettempdir(), "abaqus_mcp_%s.json" % uuid.uuid4().hex
     )
-    command = _kernel_wrapper(code, response_path)
+    command = _kernel_wrapper(code, response_path, execution_id)
     _log("sendCommand start response_path=%s" % response_path)
     sendCommand(command, False, False)
 
@@ -487,12 +502,45 @@ def _run_kernel_code(code, timeout):
             if not payload.get("ok"):
                 error = payload.get("error", {})
                 _log("kernel error: %s" % error.get("message", "kernel command failed"))
-                raise RuntimeError(error.get("message", "kernel command failed"))
+                raise GuiBridgeExecutionError(
+                    error.get("message", "kernel command failed"),
+                    state="UNKNOWN",
+                    error_type=error.get("type", "KernelError"),
+                )
             _log("kernel response ok")
             return payload["result"]
         time.sleep(0.05)
 
-    raise TimeoutError("timed out waiting for Abaqus kernel response")
+    raise GuiBridgeExecutionError(
+        "timed out while Abaqus kernel execution was running; outcome unknown",
+        state="UNKNOWN",
+        error_type="TimeoutError",
+    )
+
+
+class GuiRequest:
+    def __init__(self, method, params):
+        self.method = method
+        self.params = params
+        self.event = threading.Event()
+        self.lock = threading.Lock()
+        self.state = "queued"
+        self.result = None
+        self.error = None
+
+    def cancel_if_queued(self):
+        with self.lock:
+            if self.state != "queued":
+                return False
+            self.state = "cancelled"
+            return True
+
+    def start_if_queued(self):
+        with self.lock:
+            if self.state != "queued":
+                return False
+            self.state = "running"
+            return True
 
 
 class McpGuiHandler(socketserver.BaseRequestHandler):
@@ -503,10 +551,21 @@ class McpGuiHandler(socketserver.BaseRequestHandler):
             request_id = message.get("id")
             method = message.get("method")
             params = message.get("params") or {}
+            execution_id = params.get("executionId") or request_id
             _log("request method=%s id=%s" % (method, request_id))
 
+            if request_id is not None and execution_id != request_id:
+                raise GuiBridgeExecutionError(
+                    "request id and executionId do not match",
+                    state="NOT_STARTED",
+                    error_type="ExecutionIdMismatch",
+                )
             if _DISPATCHER is None:
-                raise RuntimeError("GUI dispatcher is not initialized")
+                raise GuiBridgeExecutionError(
+                    "GUI dispatcher is not initialized",
+                    state="NOT_STARTED",
+                    error_type="DispatcherUnavailable",
+                )
 
             wait_timeout = float(params.get("timeout") or os.environ.get("ABAQUS_MCP_TIMEOUT", "60")) + 5.0
             item = GuiRequest(method, params)
@@ -514,7 +573,17 @@ class McpGuiHandler(socketserver.BaseRequestHandler):
             _log("queued method=%s id=%s" % (method, request_id))
 
             if not item.event.wait(wait_timeout):
-                raise TimeoutError("timed out waiting for GUI dispatcher")
+                if item.cancel_if_queued():
+                    raise GuiBridgeExecutionError(
+                        "timed out before GUI execution; request cancelled",
+                        state="CANCELLED",
+                        error_type="TimeoutError",
+                    )
+                raise GuiBridgeExecutionError(
+                    "timed out while GUI execution was running; outcome unknown",
+                    state="UNKNOWN",
+                    error_type="TimeoutError",
+                )
             if item.error is not None:
                 raise item.error
             result = item.result
@@ -523,6 +592,12 @@ class McpGuiHandler(socketserver.BaseRequestHandler):
             _log("response ok id=%s" % request_id)
         except Exception as exc:
             _log("response error id=%s error=%s" % (request_id, exc))
+            error_state = getattr(exc, "state", "UNKNOWN")
+            error_type = getattr(
+                exc,
+                "error_type",
+                "%s.%s" % (type(exc).__module__, type(exc).__name__),
+            )
             _send(
                 self.request,
                 {
@@ -530,7 +605,8 @@ class McpGuiHandler(socketserver.BaseRequestHandler):
                     "ok": False,
                     "error": {
                         "message": str(exc),
-                        "type": "%s.%s" % (type(exc).__module__, type(exc).__name__),
+                        "type": error_type,
+                        "state": error_state,
                         "traceback": traceback.format_exc(),
                     },
                 },
@@ -547,19 +623,11 @@ _DISPATCHER = None
 _REQUESTS = queue.Queue()
 
 
-class GuiRequest:
-    def __init__(self, method, params):
-        self.method = method
-        self.params = params
-        self.event = threading.Event()
-        self.result = None
-        self.error = None
-
-
 def _handle_on_gui_thread(item):
     method = item.method
     params = item.params
     timeout = float(params.get("timeout") or os.environ.get("ABAQUS_MCP_TIMEOUT", "60"))
+    execution_id = params.get("executionId", "")
 
     if method == "ping":
         code = (
@@ -577,8 +645,9 @@ def _handle_on_gui_thread(item):
             "'models': list(mdb.models.keys()), "
             "'viewports': list(session.viewports.keys())}"
         )
-        result = _run_kernel_code(code, timeout)
+        result = _run_kernel_code(code, timeout, execution_id)
         result = result["return_value"]
+        result["executionId"] = execution_id
         result["guiProcess"] = {
             "python": sys.version,
             "platform": platform.platform(),
@@ -589,10 +658,18 @@ def _handle_on_gui_thread(item):
     if method == "execute":
         code = params.get("code")
         if not isinstance(code, string_types) or not code.strip():
-            raise ValueError("params.code must be a non-empty string")
-        return _run_kernel_code(code, timeout)
+            raise GuiBridgeExecutionError(
+                "params.code must be a non-empty string",
+                state="NOT_STARTED",
+                error_type="ValueError",
+            )
+        return _run_kernel_code(code, timeout, execution_id)
 
-    raise ValueError("unknown method: %r" % method)
+    raise GuiBridgeExecutionError(
+        "unknown method: %r" % method,
+        state="NOT_STARTED",
+        error_type="ValueError",
+    )
 
 
 def start_gui_agent():
@@ -657,6 +734,9 @@ class McpGuiActionForm(AFXForm):
                 item = _REQUESTS.get_nowait()
             except queue.Empty:
                 break
+            if not item.start_if_queued():
+                processed += 1
+                continue
             try:
                 _log("GUI thread handling method=%s" % item.method)
                 item.result = _handle_on_gui_thread(item)
@@ -665,6 +745,8 @@ class McpGuiActionForm(AFXForm):
                 item.error = exc
                 _log("GUI thread error method=%s error=%s" % (item.method, exc))
             finally:
+                with item.lock:
+                    item.state = "done"
                 item.event.set()
             processed += 1
 
