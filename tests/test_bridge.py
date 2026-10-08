@@ -58,6 +58,99 @@ class KernelResultLifecycleTests(unittest.TestCase):
         self.assertEqual(second["executionId"], "execution-1")
         self.assertNotIn("result", self.kernel_scope["_ABAQUS_MCP_GLOBALS"])
 
+    def test_deep_error_reports_compact_user_frame(self):
+        error = self.execute(
+            "def broken():\n"
+            "    raise ValueError('bad')\n"
+            "broken()",
+            "deep-error",
+        )
+
+        self.assertFalse(error["ok"])
+        self.assertEqual(error["error_line"], 2)
+        self.assertEqual(error["primary_frame"]["function"], "broken")
+        self.assertIn("raise ValueError('bad')", error["code_excerpt"])
+        self.assertNotIn("traceback", error)
+
+    def test_function_defined_in_prior_call_uses_its_source(self):
+        self.execute(
+            "def build():\n    raise ValueError('inside build')",
+            "definition",
+        )
+        failure = self.execute("build()", "invocation")
+
+        self.assertEqual(
+            failure["primary_frame"],
+            {"file": "<abaqus-mcp:definition>", "line": 2, "function": "build"},
+        )
+        self.assertIn("raise ValueError('inside build')", failure["code_excerpt"])
+
+    def test_external_script_reports_actual_file_and_key_hint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "build_model.py"
+            script.write_text(
+                "def build():\n"
+                "    parts = {'ConcreteCylinder': 1}\n"
+                "    return parts['ConcreteCylindr']\n"
+                "build()\n",
+                encoding="utf-8",
+            )
+            code = (
+                "exec(compile(open(%r, encoding='utf-8').read(), %r, 'exec'), globals())"
+                % (str(script), str(script))
+            )
+            failure = self.execute(code, "external")
+
+        self.assertEqual(
+            failure["primary_frame"],
+            {"file": str(script), "line": 3, "function": "build"},
+        )
+        self.assertEqual(failure["code_line"], "return parts['ConcreteCylindr']")
+        self.assertIn("ConcreteCylinder", failure["recovery"]["possible_keys"])
+        self.assertNotIn("available_keys_sample", failure["recovery"])
+
+    def test_diagnostic_suggestions_are_bounded_and_actionable(self):
+        method = self.execute(
+            "class Part:\n"
+            "    def generateMesh(self):\n"
+            "        pass\n"
+            "part = Part()\n"
+            "part.genrateMesh()",
+            "method",
+        )
+        self.assertIn("generateMesh", method["recovery"]["possible_members"])
+
+        keyword = self.execute("sorted([2, 1], revers=True)", "keyword")
+        self.assertIn("reverse", keyword["recovery"]["possible_keywords"])
+
+        name = self.execute("mesh.Mesh()", "name")
+        self.assertEqual(name["recovery"]["import_suggestion"], "from abaqus import mesh")
+
+        typo = self.execute("pritn('hello')", "name-typo")
+        self.assertIn("print", typo["recovery"]["possible_names"])
+
+    def test_syntax_error_reports_line_offset_and_text(self):
+        failure = self.execute("def broken(:\n    pass\n", "syntax")
+
+        self.assertEqual(failure["primary_frame"]["line"], 1)
+        self.assertEqual(failure["recovery"]["syntax_line"], 1)
+        self.assertIsNotNone(failure["recovery"]["syntax_offset"])
+        self.assertIn("def broken(:", failure["recovery"]["syntax_text"])
+
+    def test_nonserializable_result_does_not_poison_next_call(self):
+        first = self.execute(
+            "class Bad:\n"
+            "    def __repr__(self):\n"
+            "        raise RuntimeError('repr failed')\n"
+            "result = Bad()",
+            "bad-result",
+        )
+        second = self.execute("print('second only')", "after-bad-result")
+
+        self.assertIn("repr failed", first["return_value"]["repr"])
+        self.assertIsNone(second["return_value"])
+        self.assertEqual(second["stdout"], "second only\n")
+
 
 class _FakeSocket:
     def __enter__(self):

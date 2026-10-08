@@ -127,9 +127,16 @@ import difflib
 import io
 import inspect
 import json
+import linecache
 import os
+import re
 import sys
 import traceback
+
+try:
+    import builtins
+except ImportError:
+    import __builtin__ as builtins
 
 code = base64.b64decode("__ABAQUS_MCP_CODE__").decode("utf-8")
 response_path = base64.b64decode("__ABAQUS_MCP_RESPONSE__").decode("utf-8")
@@ -179,19 +186,43 @@ def _jsonable(value):
         if isinstance(value, set):
             return [_jsonable(v) for v in sorted(list(value), key=lambda x: repr(x))]
     try:
-        json.dumps(value, ensure_ascii=True)
+        json.dumps(value, ensure_ascii=True, allow_nan=False)
         return value
     except Exception:
+        try:
+            description = repr(value)
+        except Exception as exc:
+            description = "<repr failed: %s>" % type(exc).__name__
         return {
-            "repr": _jsonable(repr(value)),
+            "repr": _jsonable(description[:4000]),
             "type": _jsonable("%s.%s" % (type(value).__module__, type(value).__name__)),
         }
 
 def _node_source(node):
-    try:
-        return ast.unparse(node)
-    except Exception:
-        return None
+    unparse = getattr(ast, "unparse", None)
+    if unparse is not None:
+        try:
+            return unparse(node)
+        except Exception:
+            pass
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _node_source(node.value)
+        return "%s.%s" % (base, node.attr) if base else None
+    if isinstance(node, ast.Subscript):
+        base = _node_source(node.value)
+        key = _node_source(node.slice)
+        return "%s[%s]" % (base, key) if base and key else None
+    if isinstance(node, ast.Index):
+        return _node_source(node.value)
+    if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
+        return repr(node.value)
+    if isinstance(node, ast.Str):
+        return repr(node.s)
+    if isinstance(node, ast.Num):
+        return repr(node.n)
+    return None
 
 def _key_literal(node):
     if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
@@ -204,12 +235,50 @@ def _key_literal(node):
         return _key_literal(node.value)
     return None
 
-def _extract_tb_lineno(exc):
-    tb = getattr(exc, "__traceback__", None)
+def _is_user_source(filename):
+    if filename.startswith("<abaqus-mcp:"):
+        return True
+    if not filename or filename.startswith("<") or not os.path.isfile(filename):
+        return False
+    normalized = os.path.normcase(os.path.abspath(filename))
+    portable = normalized.replace("\\", "/").lower()
+    if "/site-packages/" in portable or "/dist-packages/" in portable:
+        return False
+    roots = [sys.prefix]
+    base_prefix = getattr(sys, "base_prefix", None)
+    if base_prefix:
+        roots.append(base_prefix)
+    traceback_root = os.path.dirname(os.path.dirname(traceback.__file__))
+    roots.append(traceback_root)
+    for root in roots:
+        root_path = os.path.normcase(os.path.abspath(root))
+        if normalized == root_path or normalized.startswith(root_path + os.sep):
+            return False
+    return True
+
+
+def _traceback_frames(tb):
+    frames = []
     while tb is not None:
-        if tb.tb_frame.f_code.co_filename == "<abaqus-mcp>":
-            return tb.tb_lineno
+        filename = tb.tb_frame.f_code.co_filename
+        if _is_user_source(filename):
+            frames.append({
+                "file": filename,
+                "line": tb.tb_lineno,
+                "function": tb.tb_frame.f_code.co_name,
+            })
         tb = tb.tb_next
+    return frames
+
+
+def _extract_tb_lineno(exc, tb=None):
+    if hasattr(exc, "lineno") and getattr(exc, "lineno") is not None:
+        return getattr(exc, "lineno")
+    if tb is None:
+        tb = getattr(exc, "__traceback__", None)
+    frames = _traceback_frames(tb)
+    if frames:
+        return frames[-1]["line"]
     return None
 
 def _find_subscript_parent(source, missing_key, lineno=None):
@@ -223,21 +292,32 @@ def _find_subscript_parent(source, missing_key, lineno=None):
             src = _node_source(node.value)
             if src is not None:
                 candidates.append((getattr(node, "lineno", 0), src))
+    if not candidates and lineno is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and getattr(node, "lineno", None) == lineno:
+                src = _node_source(node.value)
+                if src is not None:
+                    candidates.append((lineno, src))
     if not candidates:
         return None
     if lineno is not None:
         candidates.sort(key=lambda c: abs(c[0] - lineno))
     return candidates[0][1]
 
-def _find_attribute_parent(source, missing_attr):
+def _find_attribute_parent(source, missing_attr, lineno=None):
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
+    candidates = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == missing_attr:
-            return _node_source(node.value)
-    return None
+            candidates.append((getattr(node, "lineno", 0), _node_source(node.value)))
+    if not candidates:
+        return None
+    if lineno is not None:
+        candidates.sort(key=lambda item: abs(item[0] - lineno))
+    return candidates[0][1]
 
 def _extract_func_name(exc):
     import re
@@ -269,7 +349,9 @@ def _extract_code_excerpt(code, lineno, radius=2):
 def _resolve_simple_expr(expr, namespace):
     def _eval_node(node):
         if isinstance(node, ast.Name):
-            return namespace[node.id]
+            if node.id in namespace:
+                return namespace[node.id]
+            return getattr(builtins, node.id)
         if isinstance(node, ast.Attribute):
             return getattr(_eval_node(node.value), node.attr)
         if isinstance(node, ast.Subscript):
@@ -287,22 +369,82 @@ def _extract_call_target(code, lineno):
     if lineno is None:
         return None
     try:
-        lines = code.splitlines()
-        if lineno - 1 < 0 or lineno - 1 >= len(lines):
-            return None
-        node = ast.parse(lines[lineno - 1], mode="exec")
+        tree = ast.parse(code)
     except Exception:
+        try:
+            lines = code.splitlines()
+            if lineno - 1 < 0 or lineno - 1 >= len(lines):
+                return None
+            tree = ast.parse(lines[lineno - 1], mode="exec")
+        except Exception:
+            return None
+    candidates = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        start = getattr(node, "lineno", None)
+        end = getattr(node, "end_lineno", start)
+        if start is None:
+            continue
+        if end is None:
+            end = start
+        if start <= lineno <= end:
+            candidates.append(node)
+    if not candidates:
         return None
-    for item in ast.walk(node):
-        if isinstance(item, ast.Call):
-            return _node_source(item.func)
+    candidates.sort(
+        key=lambda item: (
+            getattr(item, "end_lineno", getattr(item, "lineno", 0))
+            - getattr(item, "lineno", 0)
+        )
+    )
+    return _node_source(candidates[0].func)
+
+
+def _extract_params_from_sig(sig_str):
+    match = re.search(r"\((.*)\)", sig_str)
+    if not match:
+        return []
+    content = match.group(1)
+    params = []
+    depth = 0
+    current = []
+    for char in content:
+        if char in "([{":
+            depth += 1
+            current.append(char)
+        elif char in ")]}":
+            depth -= 1
+            current.append(char)
+        elif char == "," and depth == 0:
+            params.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        params.append("".join(current).strip())
+    names = []
+    for param in params:
+        match = re.match(r"^([a-zA-Z_]\w*)", param)
+        if match and match.group(1) not in ("self", "cls", "args", "kwargs"):
+            names.append(match.group(1))
+    return names
+
+
+def _extract_invalid_keyword(message):
+    patterns = (
+        r"got an unexpected keyword argument ['\"](\w+)['\"]",
+        r"['\"](\w+)['\"] is an invalid keyword argument",
+        r"keyword error on (\w+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message, re.I)
+        if match:
+            return match.group(1)
     return None
 
 def _summarize_mapping_keys(mapping_obj, missing_key):
-    result = {
-        "available_keys_sample": [],
-        "possible_keys": [],
-    }
+    result = {"possible_keys": []}
     keys_method = getattr(mapping_obj, "keys", None)
     if not callable(keys_method):
         return result
@@ -311,12 +453,16 @@ def _summarize_mapping_keys(mapping_obj, missing_key):
     except Exception:
         return result
 
-    result["available_keys_sample"] = key_texts
+    result["available_key_count"] = len(key_texts)
     if missing_key is not None:
         try:
-            result["possible_keys"] = difflib.get_close_matches(str(missing_key), key_texts, n=8, cutoff=0.45)
+            result["possible_keys"] = difflib.get_close_matches(
+                str(missing_key), key_texts, n=3, cutoff=0.6
+            )
         except Exception:
             pass
+    if not result["possible_keys"]:
+        result["available_keys_sample"] = key_texts[:5]
     return result
 
 def _summarize_object_members(obj, missing_attr):
@@ -328,15 +474,42 @@ def _summarize_object_members(obj, missing_attr):
 
     if missing_attr:
         try:
-            result["possible_members"] = difflib.get_close_matches(missing_attr, members, n=10, cutoff=0.45)
+            result["possible_members"] = difflib.get_close_matches(
+                missing_attr, members, n=3, cutoff=0.6
+            )
         except Exception:
             pass
     return result
 
-def _summarize_callable(target_expr, namespace):
+
+def _extract_signature_from_docstring(doc, target_name):
+    pattern = r"\b" + re.escape(target_name) + r"\s*\("
+    match = re.search(pattern, doc)
+    if not match:
+        return None
+    start = match.start()
+    open_paren = match.end() - 1
+    depth = 0
+    end = -1
+    for index in range(open_paren, min(open_paren + 1000, len(doc))):
+        char = doc[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end < 0:
+        return None
+    return " ".join(doc[start:end].split())
+
+
+def _summarize_callable(target_expr, namespace, invalid_keyword=None):
     summary = {
         "call_target": target_expr,
-        "callable_doc_excerpt": None,
+        "callable_signature": None,
+        "callable_summary": None,
     }
     if not target_expr:
         return summary
@@ -345,67 +518,289 @@ def _summarize_callable(target_expr, namespace):
     except Exception:
         return summary
 
+    target_name = getattr(target, "__name__", "function")
+    sig_str = None
+    signature = getattr(inspect, "signature", None)
+    if signature is not None:
+        try:
+            sig_str = "%s%s" % (target_name, signature(target))
+        except Exception:
+            sig_str = None
+    if sig_str is None:
+        argspec = getattr(inspect, "getfullargspec", None) or getattr(inspect, "getargspec", None)
+        if argspec is not None:
+            try:
+                spec = argspec(target)
+                args = list(getattr(spec, "args", []) or [])
+                varargs = getattr(spec, "varargs", None)
+                keywords = getattr(spec, "varkw", None) or getattr(spec, "keywords", None)
+                if args and args[0] in ("self", "cls"):
+                    args = args[1:]
+                if varargs:
+                    args.append("*" + varargs)
+                if keywords:
+                    args.append("**" + keywords)
+                sig_str = "%s(%s)" % (target_name, ", ".join(args))
+            except Exception:
+                sig_str = None
+    if sig_str is None:
+        sig_str = "%s(...)" % target_name
+
+    doc = None
     try:
-        doc = inspect.getdoc(target) or ""
-        summary["callable_doc_excerpt"] = doc[:400] if doc else None
+        doc = inspect.getdoc(target)
     except Exception:
-        summary["callable_doc_excerpt"] = None
+        pass
+    if not doc:
+        try:
+            doc = getattr(target, "__doc__", None)
+        except Exception:
+            pass
+    if doc:
+        lines = doc.strip().splitlines()
+        if lines:
+            first_line = lines[0].strip()
+            if " -> " in first_line:
+                first_line = first_line.split(" -> ", 1)[1].strip()
+            summary["callable_summary"] = first_line or None
+        if sig_str.endswith("(...)"):
+            extracted = _extract_signature_from_docstring(doc, target_name)
+            if extracted:
+                sig_str = extracted
+    if len(sig_str) > 320:
+        sig_str = sig_str[:317] + "..."
+    summary["callable_signature"] = sig_str
+
+    if invalid_keyword:
+        valid_params = []
+        if signature is not None:
+            try:
+                valid_params = [
+                    name for name in signature(target).parameters.keys()
+                    if name not in ("self", "cls", "args", "kwargs")
+                ]
+            except Exception:
+                valid_params = []
+        if not valid_params:
+            valid_params = _extract_params_from_sig(sig_str)
+        if valid_params:
+            summary["possible_keywords"] = difflib.get_close_matches(
+                invalid_keyword, valid_params, n=3, cutoff=0.6
+            )
     return summary
 
-def _format_execution_error(source, exc, namespace=None):
+def _format_execution_error(source, exc, namespace=None, tb=None):
     tb_str = traceback.format_exc()
-    tb_lines = [l for l in tb_str.strip().splitlines() if l.strip()]
+    tb_lines = [line for line in tb_str.strip().splitlines() if line.strip()]
     core_error = tb_lines[-1] if tb_lines else str(exc)
-    error_type = "%s.%s" % (type(exc).__module__, type(exc).__name__)
-    lineno = _extract_tb_lineno(exc)
-    code_excerpt = _extract_code_excerpt(source, lineno)
+    exc_type_name = type(exc).__name__
+    error_module = type(exc).__module__
+    if not isinstance(error_module, str):
+        error_module = getattr(error_module, "__name__", str(error_module))
+    error_type = "%s.%s" % (error_module, exc_type_name)
 
-    if isinstance(exc, KeyError):
-        missing_key = exc.args[0] if exc.args else None
-        parent_path = _find_subscript_parent(source, missing_key, lineno)
+    if tb is None:
+        tb = getattr(exc, "__traceback__", None)
+    user_tbs = []
+    cursor = tb
+    while cursor is not None:
+        if _is_user_source(cursor.tb_frame.f_code.co_filename):
+            user_tbs.append(cursor)
+        cursor = cursor.tb_next
+    primary_tb = user_tbs[-1] if user_tbs else None
+
+    syntax_file = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
+    if syntax_file and _is_user_source(syntax_file):
+        lineno = getattr(exc, "lineno", None)
+        primary_frame = {
+            "file": syntax_file,
+            "line": lineno,
+            "function": "<module>",
+        }
+    elif primary_tb is not None:
+        lineno = primary_tb.tb_lineno
+        primary_frame = {
+            "file": primary_tb.tb_frame.f_code.co_filename,
+            "line": lineno,
+            "function": primary_tb.tb_frame.f_code.co_name,
+        }
+    else:
+        lineno = _extract_tb_lineno(exc, tb)
+        primary_frame = None
+
+    source_file = primary_frame.get("file") if primary_frame else None
+    if source_file and not source_file.startswith("<"):
+        linecache.checkcache(source_file)
+    source_for_error = "".join(linecache.getlines(source_file)) if source_file else source
+    if not source_for_error:
+        source_for_error = source
+
+    diagnostic_namespace = dict(namespace or {})
+    if primary_tb is not None:
+        diagnostic_namespace.update(primary_tb.tb_frame.f_globals)
+        diagnostic_namespace.update(primary_tb.tb_frame.f_locals)
+
+    code_excerpt = _extract_code_excerpt(source_for_error, lineno)
+    source_lines = source_for_error.splitlines()
+    code_line = None
+    if lineno is not None and 0 < lineno <= len(source_lines):
+        code_line = source_lines[lineno - 1].strip()[:240]
+
+    is_key_error = isinstance(exc, KeyError) or exc_type_name.endswith("KeyError")
+    is_attribute_error = isinstance(exc, AttributeError) or exc_type_name.endswith("AttributeError")
+    is_name_error = exc_type_name == "NameError"
+    is_type_error = isinstance(exc, TypeError) or exc_type_name.endswith("TypeError")
+    is_syntax_error = isinstance(exc, SyntaxError) or exc_type_name.endswith("SyntaxError")
+
+    detected_missing_key = None
+    detected_parent_path = None
+    if lineno is not None:
+        try:
+            if 0 <= lineno - 1 < len(source_lines):
+                line_tree = ast.parse(source_lines[lineno - 1])
+                for node in ast.walk(line_tree):
+                    if not isinstance(node, ast.Subscript):
+                        continue
+                    val_key = _key_literal(node.slice)
+                    if val_key is None and isinstance(node.slice, ast.Name):
+                        val_key = diagnostic_namespace.get(node.slice.id)
+                    if val_key is None:
+                        continue
+                    parent_path = _node_source(node.value)
+                    if not parent_path:
+                        continue
+                    try:
+                        parent_obj = _resolve_simple_expr(parent_path, diagnostic_namespace)
+                        keys_method = getattr(parent_obj, "keys", None)
+                        if not callable(keys_method):
+                            continue
+                        try:
+                            keys_list = list(keys_method())
+                            is_missing = val_key not in keys_list
+                        except Exception:
+                            is_missing = val_key not in parent_obj
+                        if is_missing:
+                            is_key_error = True
+                            detected_missing_key = val_key
+                            detected_parent_path = parent_path
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if is_key_error:
+        missing_key = (
+            detected_missing_key
+            if detected_missing_key is not None
+            else (exc.args[0] if exc.args else None)
+        )
+        parent_path = (
+            detected_parent_path
+            if detected_parent_path is not None
+            else _find_subscript_parent(source_for_error, missing_key, lineno)
+        )
         recovery = {
             "missing_key": _jsonable(missing_key),
             "parent_object_path": parent_path,
         }
-        if parent_path and namespace is not None:
+        if parent_path:
             try:
-                parent_obj = _resolve_simple_expr(parent_path, namespace)
+                parent_obj = _resolve_simple_expr(parent_path, diagnostic_namespace)
                 recovery.update(_summarize_mapping_keys(parent_obj, missing_key))
             except Exception:
                 pass
-    elif isinstance(exc, AttributeError):
+    elif is_attribute_error:
         missing_attr = getattr(exc, "name", None)
+        if not missing_attr:
+            match = re.search(r"has no attribute ['\"]([^'\"]+)['\"]", str(exc))
+            if match:
+                missing_attr = match.group(1)
         source_obj = getattr(exc, "obj", None)
+        parent_path = (
+            _find_attribute_parent(source_for_error, missing_attr, lineno)
+            if missing_attr
+            else None
+        )
+        if source_obj is None and parent_path:
+            try:
+                source_obj = _resolve_simple_expr(parent_path, diagnostic_namespace)
+            except Exception:
+                pass
         object_type = type(source_obj).__name__ if source_obj is not None else None
-        parent_path = _find_attribute_parent(source, missing_attr) if missing_attr else None
         recovery = {
             "missing_attribute": missing_attr,
             "object_type": object_type,
             "parent_object_path": parent_path,
         }
         if source_obj is not None:
-            try:
-                recovery.update(_summarize_object_members(source_obj, missing_attr))
-            except Exception:
-                pass
-    elif isinstance(exc, NameError):
+            recovery.update(_summarize_object_members(source_obj, missing_attr))
+    elif is_name_error:
+        missing_var = getattr(exc, "name", None)
+        if not missing_var:
+            match = re.search(r"name ['\"]([^'\"]+)['\"] is not defined", str(exc))
+            if match:
+                missing_var = match.group(1)
+        recovery = {"missing_variable": missing_var}
+        if missing_var:
+            names = sorted(
+                set([str(key) for key in diagnostic_namespace.keys()] + dir(builtins))
+            )
+            recovery["possible_names"] = difflib.get_close_matches(
+                missing_var, names, n=3, cutoff=0.6
+            )
+        abaqus_modules = set([
+            "mesh", "part", "material", "assembly", "step", "interaction",
+            "load", "section", "sketch", "job", "connector", "visualization",
+            "xyPlot", "displayGroup", "meshEdit", "connectorBehavior",
+            "symbolicConstants",
+        ])
+        if missing_var in abaqus_modules:
+            recovery["import_suggestion"] = "from abaqus import %s" % missing_var
+        elif missing_var == "C":
+            recovery["import_suggestion"] = "from abaqusConstants import *"
+        elif missing_var and missing_var.isupper() and len(missing_var) > 1:
+            recovery["import_suggestion"] = "from abaqusConstants import *"
+    elif is_syntax_error:
         recovery = {
-            "missing_variable": getattr(exc, "name", None),
+            "syntax_line": getattr(exc, "lineno", None),
+            "syntax_offset": getattr(exc, "offset", None),
+            "syntax_text": getattr(exc, "text", None),
         }
-    elif isinstance(exc, TypeError):
-        call_target = _extract_call_target(source, lineno)
+    elif is_type_error:
+        call_target = _extract_call_target(source_for_error, lineno)
+        invalid_keyword = _extract_invalid_keyword(core_error)
         recovery = {"call_target": call_target}
-        if namespace is not None:
-            recovery.update(_summarize_callable(call_target, namespace))
+        recovery.update(
+            _summarize_callable(call_target, diagnostic_namespace, invalid_keyword)
+        )
     else:
         recovery = {}
 
+    if not recovery:
+        call_target = _extract_call_target(source_for_error, lineno)
+        if call_target:
+            recovery = _summarize_callable(call_target, diagnostic_namespace)
+
+    frames = [
+        {
+            "file": frame.tb_frame.f_code.co_filename,
+            "line": frame.tb_lineno,
+            "function": frame.tb_frame.f_code.co_name,
+        }
+        for frame in user_tbs[-5:]
+    ]
     return {
         "ok": False,
         "core_error": core_error,
+        "message": getattr(exc, "msg", str(exc)) if is_syntax_error else str(exc),
         "error_type": error_type,
         "error_line": lineno,
+        "primary_frame": primary_frame,
+        "frames": frames,
+        "traceback_tail": tb_lines[-8:] if len(tb_lines) > 8 else tb_lines,
         "code_excerpt": code_excerpt,
+        "code_line": code_line,
         "recovery": recovery,
     }
 
@@ -419,6 +814,14 @@ namespace.update({
 })
 namespace.pop("result", None)
 
+filename = "<abaqus-mcp:%s>" % (execution_id or "legacy")
+if len(code) <= 262144:
+    source_keys = globals().setdefault("_ABAQUS_MCP_SOURCE_KEYS", [])
+    linecache.cache[filename] = (len(code), None, code.splitlines(True), filename)
+    source_keys.append(filename)
+    if len(source_keys) > 128:
+        linecache.cache.pop(source_keys.pop(0), None)
+
 stdout = io.StringIO()
 stderr = io.StringIO()
 returned = None
@@ -428,19 +831,20 @@ payload = None
 try:
     with _redirect_streams(stdout, stderr):
         try:
-            try:
-                parsed = ast.parse(code, mode="eval")
-            except SyntaxError:
-                parsed = ast.parse(code, mode="exec")
-                compiled = compile(parsed, "<abaqus-mcp>", "exec")
+            parsed = ast.parse(code, filename=filename, mode="exec")
+            if len(parsed.body) == 1 and isinstance(parsed.body[0], ast.Expr):
+                mode = "eval"
+                expression = ast.Expression(body=parsed.body[0].value)
+                compiled = compile(expression, filename, "eval")
+                returned = eval(compiled, namespace, namespace)
+            else:
+                compiled = compile(parsed, filename, "exec")
                 _exec_compiled(compiled, namespace)
                 returned = namespace.pop("result", None)
-            else:
-                mode = "eval"
-                compiled = compile(parsed, "<abaqus-mcp>", "eval")
-                returned = eval(compiled, namespace, namespace)
         except Exception as exc:
-            returned_error = _format_execution_error(code, exc, namespace)
+            returned_error = _format_execution_error(
+                code, exc, namespace, sys.exc_info()[2]
+            )
             returned_error["executionId"] = execution_id
             payload = {
                 "ok": True,
@@ -460,7 +864,9 @@ try:
             },
         }
 except Exception as exc:
-    execution_error = _format_execution_error(code, exc)
+    execution_error = _format_execution_error(
+        code, exc, namespace, sys.exc_info()[2]
+    )
     execution_error["executionId"] = execution_id
     payload = {
         "ok": True,
